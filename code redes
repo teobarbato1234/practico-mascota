@@ -1,0 +1,212 @@
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Scanner;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+/**
+ * Escaneo de red y gestión de recursos por aula
+ * 2.º BT - Tecnología de la Información
+ *
+ * A partir de una IP (por ejemplo, la IP del switch/gateway del aula),
+ * escanea toda la red /24 correspondiente, determina qué equipos están
+ * activos e inactivos, y para los activos obtiene su dirección MAC.
+ *
+ * Pensado para ejecutarse en un servidor Linux (usa los comandos
+ * "ping" e "ip neigh" / "arp -n" del sistema).
+ *
+ * Compilar:  javac NetworkScanner.java
+ * Ejecutar:  java NetworkScanner
+ * (el programa pide la IP por teclado al iniciar)
+ */
+public class NetworkScanner {
+
+    public static void main(String[] args) throws Exception {
+        Scanner sc = new Scanner(System.in);
+        String baseIp = null;
+
+        // Se pide la IP hasta que el usuario ingrese un formato válido
+        while (baseIp == null) {
+            System.out.print("Ingrese la IP base de la red a escanear (ej: 192.168.1.1): ");
+            String entrada = sc.nextLine().trim();
+
+            String[] partes = entrada.split("\\.");
+            if (partes.length != 4) {
+                System.out.println("IP inválida. Formato esperado: X.X.X.X\n");
+                continue;
+            }
+
+            boolean valida = true;
+            for (String parte : partes) {
+                try {
+                    int octeto = Integer.parseInt(parte);
+                    if (octeto < 0 || octeto > 255) {
+                        valida = false;
+                        break;
+                    }
+                } catch (NumberFormatException e) {
+                    valida = false;
+                    break;
+                }
+            }
+
+            if (!valida) {
+                System.out.println("IP inválida. Cada octeto debe ser un número entre 0 y 255.\n");
+                continue;
+            }
+
+            baseIp = entrada;
+        }
+
+        String[] partes = baseIp.split("\\.");
+        String prefijo = partes[0] + "." + partes[1] + "." + partes[2] + ".";
+
+        System.out.println("Escaneando red " + prefijo + "0/24 a partir de " + baseIp + " ...\n");
+
+        // Pool de hilos para acelerar el barrido (254 hosts)
+        ExecutorService pool = Executors.newFixedThreadPool(50);
+        List<Future<Resultado>> futures = new ArrayList<>();
+
+        for (int i = 1; i <= 254; i++) {
+            final String ip = prefijo + i;
+            futures.add(pool.submit(() -> escanearHost(ip)));
+        }
+
+        List<Resultado> activos = new ArrayList<>();
+        List<Resultado> inactivos = new ArrayList<>();
+
+        for (Future<Resultado> f : futures) {
+            Resultado r = f.get();
+            if (r.activo) {
+                activos.add(r);
+            } else {
+                inactivos.add(r);
+            }
+        }
+        pool.shutdown();
+
+        activos.sort((a, b) -> compararIp(a.ip, b.ip));
+        inactivos.sort((a, b) -> compararIp(a.ip, b.ip));
+
+        System.out.println("========== EQUIPOS ACTIVOS ==========");
+        for (Resultado r : activos) {
+            System.out.printf("IP: %-15s  MAC: %s%n", r.ip, r.mac != null ? r.mac : "No detectada");
+        }
+
+        System.out.println("\n========== EQUIPOS INACTIVOS ==========");
+        for (Resultado r : inactivos) {
+            System.out.println("IP: " + r.ip);
+        }
+
+        System.out.println("\nResumen: " + activos.size() + " activos / "
+                + inactivos.size() + " inactivos de 254 direcciones escaneadas.");
+    }
+
+    /** Hace ping a una IP y, si responde, intenta obtener su MAC. */
+    private static Resultado escanearHost(String ip) {
+        Resultado r = new Resultado();
+        r.ip = ip;
+        r.activo = ping(ip);
+        if (r.activo) {
+            r.mac = obtenerMac(ip);
+        }
+        return r;
+    }
+
+    /** Ping estilo Linux: 1 paquete, timeout de 1 segundo. */
+    private static boolean ping(String ip) {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("ping", "-c", "1", "-W", "1", ip);
+            pb.redirectErrorStream(true);
+            Process proc = pb.start();
+            // Consumir la salida para que el proceso no quede bloqueado
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
+                while (br.readLine() != null) { /* descartar */ }
+            }
+            int exit = proc.waitFor();
+            return exit == 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Obtiene la MAC de una IP usando "ip neigh" (el ping previo ya
+     * generó la entrada en la tabla ARP del sistema). Si falla,
+     * intenta con "arp -n" como respaldo.
+     */
+    private static String obtenerMac(String ip) {
+        String mac = obtenerMacConIpNeigh(ip);
+        if (mac == null) {
+            mac = obtenerMacConArp(ip);
+        }
+        return mac;
+    }
+
+    private static String obtenerMacConIpNeigh(String ip) {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("ip", "neigh", "show", ip);
+            pb.redirectErrorStream(true);
+            Process proc = pb.start();
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
+                String linea;
+                while ((linea = br.readLine()) != null) {
+                    if (linea.contains("lladdr")) {
+                        String[] tokens = linea.trim().split("\\s+");
+                        for (int i = 0; i < tokens.length; i++) {
+                            if (tokens[i].equals("lladdr") && i + 1 < tokens.length) {
+                                return tokens[i + 1];
+                            }
+                        }
+                    }
+                }
+            }
+            proc.waitFor();
+        } catch (Exception e) {
+            // Se intenta con el método de respaldo
+        }
+        return null;
+    }
+
+    private static String obtenerMacConArp(String ip) {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("arp", "-n", ip);
+            pb.redirectErrorStream(true);
+            Process proc = pb.start();
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
+                String linea;
+                while ((linea = br.readLine()) != null) {
+                    if (linea.contains(ip)) {
+                        String[] tokens = linea.trim().split("\\s+");
+                        for (String t : tokens) {
+                            if (t.matches("([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")) {
+                                return t;
+                            }
+                        }
+                    }
+                }
+            }
+            proc.waitFor();
+        } catch (Exception e) {
+            // No se pudo obtener la MAC
+        }
+        return null;
+    }
+
+    /** Compara IPs por su último octeto para poder ordenarlas. */
+    private static int compararIp(String ip1, String ip2) {
+        String[] p1 = ip1.split("\\.");
+        String[] p2 = ip2.split("\\.");
+        return Integer.compare(Integer.parseInt(p1[3]), Integer.parseInt(p2[3]));
+    }
+
+    /** Estructura simple para guardar el resultado de cada host. */
+    static class Resultado {
+        String ip;
+        boolean activo;
+        String mac;
+    }
+}
